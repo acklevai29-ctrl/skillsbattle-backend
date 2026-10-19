@@ -1,89 +1,90 @@
-const { Keypair, Connection, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL } = require('@solana/web3.js');
-const bip39 = require('bip39');
-const { derivePath } = require('ed25519-hd-key');const express = require('express');
+const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const { createClient } = require('@supabase/supabase-js');
 const cors = require('cors');
+const { Keypair, Connection, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL } = require('@solana/web3.js');
+const bip39 = require('bip39');
+const { derivePath } = require('ed25519-hd-key');
 
 const app = express();
 app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-// --- PASTE YOUR SUPABASE KEYS HERE ---
-const SUPABASE_URL = 'https://adndwbfgkyneqpykfyb.supabase.co';
-const SUPABASE_SECRET_KEY = 'sb_secret_HDVsCvY8RGEjcvjfdTkjsw_jOoH_0e4';
+// --- KEYS ---
+const SUPABASE_URL = 'YOUR_SUPABASE_URL';
+const SUPABASE_SECRET_KEY = 'YOUR_SUPABASE_SECRET_KEY';
+const MASTER_SEED = process.env.MASTER_SEED; // We will set this in Railway next
+
 const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
+const connection = new Connection("https://api.mainnet-beta.solana.com", "confirmed");
+
+// --- WALLET GENERATION ---
+async function generateUserWallet(userId) {
+  const seed = await bip39.mnemonicToSeed(MASTER_SEED);
+  let userIndex = 0;
+  for (let i = 0; i < userId.length; i++) userIndex += userId.charCodeAt(i);
+  const path = `m/44'/501'/${userIndex}'/0'`;
+  const derivedSeed = derivePath(path, seed.toString('hex')).key;
+  const keypair = Keypair.fromSeed(derivedSeed);
+  return {
+    publicKey: keypair.publicKey.toBase58(),
+    secretKey: Buffer.from(keypair.secretKey).toString('hex')
+  };
+}
 
 let waitingQueue = [];
 
 io.on('connection', (socket) => {
-  console.log(`Player connected: ${socket.id}`);
-
-  socket.on('join_queue', async (data) => {
-    const { userId, username, betAmount } = data;
+  socket.on('get_deposit_address', async (data) => {
+    const { userId } = data;
+    const { data: user } = await supabase.from('users').select('sol_deposit_address, sol_private_key').eq('id', userId).single();
     
-    // Check balance if not a bot
-    if (!username.includes('bot')) {
-      const { data: user } = await supabase.from('users').select('balance_usd').eq('id', userId).single();
-      if (!user || user.balance_usd < betAmount) {
-        return socket.emit('error_msg', 'Insufficient balance.');
-      }
-      // Deduct bet
-      await supabase.from('users').update({ balance_usd: user.balance_usd - betAmount }).eq('id', userId);
-    }
-
-    const player = { socketId: socket.id, userId, username, betAmount, cashedOut: false };
-    
-    if (waitingQueue.length > 0) {
-      const opponent = waitingQueue.shift();
-      const lobbyId = `lobby_${Date.now()}`;
-      
-      socket.join(lobbyId);
-      io.sockets.sockets.get(opponent.socketId)?.join(lobbyId);
-
-      const lobbyData = { players: [opponent, player], pot: opponent.betAmount + player.betAmount, multiplier: 1.00 };
-      
-      io.to(lobbyId).emit('match_found', { players: lobbyData.players, pot: lobbyData.pot });
-      startGame(lobbyId, lobbyData);
+    if (user && user.sol_deposit_address) {
+      socket.emit('deposit_address', user.sol_deposit_address);
     } else {
-      waitingQueue.push(player);
-      socket.emit('waiting_for_opponent');
+      const newWallet = await generateUserWallet(userId);
+      await supabase.from('users').update({ sol_deposit_address: newWallet.publicKey, sol_private_key: newWallet.secretKey }).eq('id', userId);
+      socket.emit('deposit_address', newWallet.publicKey);
     }
   });
 
-  socket.on('cashout', (lobbyId) => {
-    const p = io.sockets.adapter.rooms.get(lobbyId);
-    if(p) io.to(lobbyId).emit('player_cashed_out', socket.id);
-  });
+  // ... [KEEP YOUR EXISTING JOIN_QUEUE AND GAME LOGIC HERE] ...
+  // (Paste the join_queue, cashout, and startGame logic from your previous code here)
 
-  socket.on('disconnect', () => {
-    waitingQueue = waitingQueue.filter(p => p.socketId !== socket.id);
-  });
 });
 
-function startGame(lobbyId, lobby) {
-  io.to(lobbyId).emit('game_started');
-  const crashPoint = (Math.random() * 3) + 1.1; 
-  
-  let tick = setInterval(async () => {
-    lobby.multiplier += 0.05;
-    io.to(lobbyId).emit('tick', lobby.multiplier);
+// --- DEPOSIT SWEEPER (Checks every 30s) ---
+async function checkDepositsAndSweep() {
+  const { data: users } = await supabase.from('users').select('id, sol_deposit_address, sol_private_key').not('sol_deposit_address', 'is', null);
+  if (!users) return;
 
-    if (lobby.multiplier >= crashPoint) {
-      clearInterval(tick);
-      io.to(lobbyId).emit('game_crashed', crashPoint);
-      
-      // Logic for who wins goes here (simplified for now)
-      // In a full version, you'd check who cashed out before crashPoint
-      
-      setTimeout(() => {
-        io.to(lobbyId).emit('game_over', { message: 'Game over' });
-      }, 2000);
-    }
-  }, 100);
+  for (const user of users) {
+    try {
+      const pubKey = new PublicKey(user.sol_deposit_address);
+      const balance = await connection.getBalance(pubKey);
+
+      if (balance > 10000000) { // > 0.01 SOL
+        const amountSOL = balance / LAMPORTS_PER_SOL;
+        const amountUSD = amountSOL * 150; // Example rate
+
+        await supabase.rpc('add_balance', { user_id: user.id, amount: amountUSD });
+        
+        const userKeypair = Keypair.fromSecretKey(Buffer.from(user.sol_private_key, 'hex'));
+        const masterSeed = await bip39.mnemonicToSeed(MASTER_SEED);
+        const masterKeypair = Keypair.fromSeed(derivePath(`m/44'/501'/0'/0'`, masterSeed.toString('hex')).key);
+
+        const transaction = new Transaction().add(
+          SystemProgram.transfer({ fromPubkey: userKeypair.publicKey, toPubkey: masterKeypair.publicKey, lamports: balance - 5000 })
+        );
+        await connection.sendTransaction(transaction, [userKeypair]);
+        console.log(`Deposited & Swept for user ${user.id}`);
+      }
+    } catch (err) { console.log(err.message); }
+  }
 }
+setInterval(checkDepositsAndSweep, 30000);
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => console.log(`Engine running on port ${PORT}`));
