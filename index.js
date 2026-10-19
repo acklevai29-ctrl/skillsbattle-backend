@@ -11,8 +11,7 @@ const io = new Server(server, { cors: { origin: "*" } });
 
 // --- PASTE YOUR SUPABASE KEYS HERE ---
 const SUPABASE_URL = 'https://adndwbfgkyneqpykfyb.supabase.co';
-const SUPABASE_SECRET_KEY = 'sb_secret_KA1vTZ_Uu0vwSLbLqDJ0Iw_za2LkO13';
-
+const SUPABASE_SECRET_KEY = 'sb_secret_HDVsCvY8RGEjcvjfdTkjsw_jOoH_0e4';
 const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
 
 let waitingQueue = [];
