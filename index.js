@@ -10,8 +10,8 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
 // --- PASTE YOUR SUPABASE KEYS HERE ---
-const SUPABASE_URL = 'PASTE_YOUR_PROJECT_URL_HERE';
-const SUPABASE_SECRET_KEY = 'PASTE_YOUR_SECRET_KEY_HERE';
+const SUPABASE_URL = 'https://adndxwbfkgyneqnkyfbb.supabase.co';
+const SUPABASE_SECRET_KEY = 'sb_secret_0iklAnX7tLXCtcqzq19Jlg_jCMrrEll';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
 
