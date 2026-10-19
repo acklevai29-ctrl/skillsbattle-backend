@@ -3,88 +3,139 @@ const http = require('http');
 const { Server } = require('socket.io');
 const { createClient } = require('@supabase/supabase-js');
 const cors = require('cors');
-const { Keypair, Connection, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL } = require('@solana/web3.js');
-const bip39 = require('bip39');
-const { derivePath } = require('ed25519-hd-key');
 
 const app = express();
 app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-// --- KEYS ---
-const SUPABASE_URL = 'YOUR_SUPABASE_URL';
-const SUPABASE_SECRET_KEY = 'YOUR_SUPABASE_SECRET_KEY';
-const MASTER_SEED = process.env.MASTER_SEED; // We will set this in Railway next
-
+const SUPABASE_URL = 'https://adndxwbfkgyneqnkyfbb.supabase.co';
+const SUPABASE_SECRET_KEY = 'sb_publishable_btxNtPha5Wtq3azIiDeg1g_oUgoqMKE';
 const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
-const connection = new Connection("https://api.mainnet-beta.solana.com", "confirmed");
 
-// --- WALLET GENERATION ---
-async function generateUserWallet(userId) {
-  const seed = await bip39.mnemonicToSeed(MASTER_SEED);
-  let userIndex = 0;
-  for (let i = 0; i < userId.length; i++) userIndex += userId.charCodeAt(i);
-  const path = `m/44'/501'/${userIndex}'/0'`;
-  const derivedSeed = derivePath(path, seed.toString('hex')).key;
-  const keypair = Keypair.fromSeed(derivedSeed);
-  return {
-    publicKey: keypair.publicKey.toBase58(),
-    secretKey: Buffer.from(keypair.secretKey).toString('hex')
-  };
-}
-
+const GRID_SIZE = 30;
 let waitingQueue = [];
+let activeGames = {};
 
 io.on('connection', (socket) => {
-  socket.on('get_deposit_address', async (data) => {
-    const { userId } = data;
-    const { data: user } = await supabase.from('users').select('sol_deposit_address, sol_private_key').eq('id', userId).single();
+  socket.on('join_queue', async (data) => {
+    const { userId, username, betAmount } = data;
     
-    if (user && user.sol_deposit_address) {
-      socket.emit('deposit_address', user.sol_deposit_address);
+    // Deduct balance logic here (omitted for brevity, keep from previous code)
+
+    const player = { socketId: socket.id, userId, username, betAmount, color: '#' + Math.floor(Math.random()*16777215).toString(16) };
+    
+    if (waitingQueue.length > 0) {
+      const opponent = waitingQueue.shift();
+      const gameId = `game_${Date.now()}`;
+      
+      socket.join(gameId);
+      io.sockets.sockets.get(opponent.socketId)?.join(gameId);
+
+      startGame(gameId, [opponent, player]);
     } else {
-      const newWallet = await generateUserWallet(userId);
-      await supabase.from('users').update({ sol_deposit_address: newWallet.publicKey, sol_private_key: newWallet.secretKey }).eq('id', userId);
-      socket.emit('deposit_address', newWallet.publicKey);
+      waitingQueue.push(player);
+      socket.emit('waiting_for_opponent');
     }
   });
 
-  // ... [KEEP YOUR EXISTING JOIN_QUEUE AND GAME LOGIC HERE] ...
-  // (Paste the join_queue, cashout, and startGame logic from your previous code here)
-
+  socket.on('change_direction', (data) => {
+    const { gameId, direction } = data;
+    const game = activeGames[gameId];
+    if (!game) return;
+    const player = game.players.find(p => p.socketId === socket.id);
+    if (player && player.alive) {
+      // Prevent 180 degree turns
+      if (player.direction === 'UP' && direction === 'DOWN') return;
+      if (player.direction === 'DOWN' && direction === 'UP') return;
+      if (player.direction === 'LEFT' && direction === 'RIGHT') return;
+      if (player.direction === 'RIGHT' && direction === 'LEFT') return;
+      player.nextDirection = direction;
+    }
+  });
 });
 
-// --- DEPOSIT SWEEPER (Checks every 30s) ---
-async function checkDepositsAndSweep() {
-  const { data: users } = await supabase.from('users').select('id, sol_deposit_address, sol_private_key').not('sol_deposit_address', 'is', null);
-  if (!users) return;
+function startGame(gameId, players) {
+  const game = {
+    gridSize: GRID_SIZE,
+    food: { x: 15, y: 15 },
+    players: players.map((p, i) => ({
+      ...p,
+      body: [{ x: 5, y: 5 + (i * 3) }],
+      direction: 'RIGHT',
+      nextDirection: 'RIGHT',
+      alive: true
+    })),
+    status: 'playing'
+  };
+  
+  activeGames[gameId] = game;
+  io.to(gameId).emit('game_started', game);
 
-  for (const user of users) {
-    try {
-      const pubKey = new PublicKey(user.sol_deposit_address);
-      const balance = await connection.getBalance(pubKey);
+  const tickRate = 120; // ms per frame
 
-      if (balance > 10000000) { // > 0.01 SOL
-        const amountSOL = balance / LAMPORTS_PER_SOL;
-        const amountUSD = amountSOL * 150; // Example rate
+  const gameLoop = setInterval(() => {
+    let aliveCount = 0;
+    let winner = null;
 
-        await supabase.rpc('add_balance', { user_id: user.id, amount: amountUSD });
-        
-        const userKeypair = Keypair.fromSecretKey(Buffer.from(user.sol_private_key, 'hex'));
-        const masterSeed = await bip39.mnemonicToSeed(MASTER_SEED);
-        const masterKeypair = Keypair.fromSeed(derivePath(`m/44'/501'/0'/0'`, masterSeed.toString('hex')).key);
+    game.players.forEach(p => {
+      if (!p.alive) return;
+      aliveCount++;
+      winner = p;
 
-        const transaction = new Transaction().add(
-          SystemProgram.transfer({ fromPubkey: userKeypair.publicKey, toPubkey: masterKeypair.publicKey, lamports: balance - 5000 })
-        );
-        await connection.sendTransaction(transaction, [userKeypair]);
-        console.log(`Deposited & Swept for user ${user.id}`);
+      p.direction = p.nextDirection;
+      const head = { ...p.body[0] };
+
+      if (p.direction === 'UP') head.y -= 1;
+      if (p.direction === 'DOWN') head.y += 1;
+      if (p.direction === 'LEFT') head.x -= 1;
+      if (p.direction === 'RIGHT') head.x += 1;
+
+      // Check wall collision
+      if (head.x < 0 || head.x >= GRID_SIZE || head.y < 0 || head.y >= GRID_SIZE) {
+        p.alive = false;
+        return;
       }
-    } catch (err) { console.log(err.message); }
-  }
+
+      // Check self collision
+      if (p.body.some(seg => seg.x === head.x && seg.y === head.y)) {
+        p.alive = false;
+        return;
+      }
+
+      // Check collision with other players
+      game.players.forEach(other => {
+        if (other.socketId !== p.socketId && other.alive) {
+          if (other.body.some(seg => seg.x === head.x && seg.y === head.y)) {
+            p.alive = false;
+          }
+        }
+      });
+
+      if (!p.alive) return;
+
+      p.body.unshift(head);
+
+      // Check food
+      if (head.x === game.food.x && head.y === game.food.y) {
+        game.food = {
+          x: Math.floor(Math.random() * GRID_SIZE),
+          y: Math.floor(Math.random() * GRID_SIZE)
+        };
+      } else {
+        p.body.pop(); // Remove tail if not eating
+      }
+    });
+
+    io.to(gameId).emit('game_state', game);
+
+    if (aliveCount <= 1) {
+      clearInterval(gameLoop);
+      io.to(gameId).emit('game_over', { winner: winner ? winner.username : 'Nobody' });
+      delete activeGames[gameId];
+    }
+  }, tickRate);
 }
-setInterval(checkDepositsAndSweep, 30000);
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => console.log(`Engine running on port ${PORT}`));
